@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VideoCMS Importer</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">STREAMINGPLAY → VIDEOCMS</p>
+        <h1>VideoCMS Importer</h1>
+        <p class="muted">Batch-import original MP4 files without re-encoding.</p>
+      </div>
+      <div class="service-pill"><span class="dot"></span> Import service</div>
+    </header>
+
+    <section class="panel create-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>New batch</h2>
+          <p class="muted">Paste one download URL per line, or upload a CSV.</p>
+        </div>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Input method">
+        <button type="button" class="tab active" data-mode="paste">Paste URLs</button>
+        <button type="button" class="tab" data-mode="csv">Upload CSV</button>
+      </div>
+      <form id="paste-form">
+        <label for="urls">StreamingPlay download URLs</label>
+        <textarea id="urls" name="urls" rows="7" placeholder="https://streamingplay.biz/download/VIDEO_ID&#10;https://streamingplay.biz/download/ANOTHER_ID" spellcheck="false"></textarea>
+        <p class="hint">The importer derives the embed URL by replacing <code>/download/</code> with <code>/embed/</code>. Duplicate URLs in the same batch are ignored.</p>
+        <div class="form-footer">
+          <span id="url-count" class="muted">0 URLs</span>
+          <button class="primary" type="submit" id="start-paste">Start batch <span aria-hidden="true">→</span></button>
+        </div>
+      </form>
+      <form id="csv-form" class="hidden">
+        <label for="csv">CSV file</label>
+        <div class="file-drop">
+          <input id="csv" name="csv" type="file" accept=".csv,text/csv" required>
+          <p class="hint">A single URL column is enough. A header named <code>url</code> or <code>download_url</code> is optional.</p>
+        </div>
+        <div class="form-footer">
+          <span class="muted">Maximum file size: 5 MB</span>
+          <button class="primary" type="submit" id="start-csv">Start batch <span aria-hidden="true">→</span></button>
+        </div>
+      </form>
+      <p id="form-error" class="error hidden" role="alert"></p>
+    </section>
+
+    <section class="workspace">
+      <section class="panel batches-panel">
+        <div class="panel-heading">
+          <div><h2>Recent batches</h2><p class="muted">Jobs survive service restarts.</p></div>
+          <button id="refresh-batches" class="icon-button" type="button" title="Refresh batches" aria-label="Refresh batches">↻</button>
+        </div>
+        <div id="batch-list" class="batch-list"><div class="empty">No batches yet.</div></div>
+      </section>
+
+      <section class="panel details-panel">
+        <div class="panel-heading detail-heading">
+          <div><h2 id="detail-title">Batch progress</h2><p id="detail-subtitle" class="muted">Select a batch to inspect its logs.</p></div>
+          <div class="actions">
+            <button id="retry-batch" class="secondary hidden" type="button">Retry failed</button>
+            <button id="cancel-batch" class="secondary danger hidden" type="button">Cancel</button>
+          </div>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-meta"><span id="progress-label">Waiting for a batch</span><span id="progress-count">0 / 0</span></div>
+          <div class="progress-track"><div id="progress-bar" class="progress-bar" style="width:0%"></div></div>
+        </div>
+        <div class="log-toolbar"><span>Live log</span><button id="clear-view" class="text-button" type="button">Clear view</button></div>
+        <pre id="log-output" class="log-output" aria-live="polite">Logs will appear here when a batch starts.</pre>
+        <div id="item-list" class="item-list"></div>
+      </section>
+    </section>
+    <footer>Original media is downloaded to configured shared storage. VideoCMS records are marked ready only after the files are verified.</footer>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

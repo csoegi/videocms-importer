@@ -1,0 +1,22 @@
+{
+  "name": "videocms-importer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-based batch importer for migrating StreamingPlay videos into VideoCMS without re-encoding.",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "NODE_ENV=development node --watch src/server.js",
+    "check": "node --check src/server.js && node --check src/worker.js && node --check src/provider.js && node --check src/store.js"
+  },
+  "engines": { "node": ">=20.11" },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "csv-parse": "^5.6.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "multer": "^1.4.5-lts.1",
+    "puppeteer": "^24.2.1"
+  }
+}

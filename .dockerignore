@@ -1,0 +1,8 @@
+node_modules
+.env
+.git
+logs
+data
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
