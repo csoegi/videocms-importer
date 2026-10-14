@@ -24,6 +24,32 @@ function convertSrtToVtt(text) {
   return `WEBVTT\n\n${body}\n`;
 }
 
+// StreamingPlay exposes two unrelated VTT-like resources: uploaded subtitles live
+// under /subtitle/ and storyboard thumbnails live under /images/.../sprite.vtt.
+// Only accept subtitle files from the canonical uploaded-subtitle route.
+function isUserUploadedSubtitleUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    if (hostname !== 'streamingplay.biz' && !hostname.endsWith('.streamingplay.biz')) return false;
+
+    const segments = decodeURIComponent(parsed.pathname).split('/').filter(Boolean);
+    if (segments.some((segment) => segment.toLowerCase() === 'images')) return false;
+    const subtitleIndex = segments.findIndex((segment) => segment.toLowerCase() === 'subtitle');
+    const filename = segments.at(-1) || '';
+    return subtitleIndex >= 0 && subtitleIndex < segments.length - 1 && /\.(?:vtt|srt)$/i.test(filename);
+  } catch {
+    return false;
+  }
+}
+
+// Extra content-level defense: a storyboard VTT contains thumbnail crops such as
+// sprite.jpg#xywh=0,0,120,211, not human-readable caption cues.
+function isSpriteThumbnailVtt(text) {
+  return /\.(?:jpe?g|png|webp)#xywh=\d+,\d+,\d+,\d+/i.test(text);
+}
+
 function waitForBrowserDownload(client, log, timeoutMs, shouldCancel) {
   let abortWait;
   const promise = new Promise((resolve, reject) => {
@@ -90,7 +116,7 @@ async function waitForDownloadedFile(dir, startedAt, timeoutMs) {
 
 async function probeVideo(filePath) {
   const executable = process.env.FFPROBE_PATH || 'ffprobe';
-  const args = ['-v', 'error', '-show_entries', 'format=format_name,duration,size:stream=codec_type,codec_name,width,height,avg_frame_rate', '-of', 'json', filePath];
+  const args = ['-v', 'error', '-show_entries', 'format=duration,size:stream=codec_type,width,height,avg_frame_rate', '-of', 'json', filePath];
   const output = await new Promise((resolve, reject) => {
     const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
@@ -101,125 +127,15 @@ async function probeVideo(filePath) {
     child.on('close', (code) => code === 0 ? resolve(stdout) : reject(new Error(`ffprobe failed with exit code ${code}: ${stderr.trim().slice(0, 500)}`)));
   });
   const parsed = JSON.parse(output);
-  const streams = parsed.streams || [];
-  const video = streams.find((stream) => stream.codec_type === 'video') || {};
-  const audio = streams.find((stream) => stream.codec_type === 'audio') || {};
+  const video = (parsed.streams || []).find((stream) => stream.codec_type === 'video') || {};
   const duration = Number(parsed.format?.duration || 0);
   const size = Number(parsed.format?.size || (await fs.stat(filePath)).size);
-  if (!Number.isFinite(duration) || duration <= 0) throw new Error(`Could not determine video duration for ${path.basename(filePath)}`);
-  if (!video.codec_name) throw new Error(`No video stream found in ${path.basename(filePath)}`);
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error('Could not determine video duration from downloaded MP4');
   const fps = String(video.avg_frame_rate || '0/1').split('/').map(Number);
   const avgFrameRate = fps[1] ? fps[0] / fps[1] : 0;
   const height = Number(video.height || 0);
   const width = Number(video.width || 0);
-  return {
-    duration, size, height, width, formatName: String(parsed.format?.format_name || ''),
-    videoCodec: String(video.codec_name || ''), audioCodec: String(audio.codec_name || ''),
-    avgFrameRate: Number.isFinite(avgFrameRate) ? avgFrameRate : 0,
-    qualityName: `${height >= 100 ? height : 720}p`
-  };
-}
-
-function isMP4Container(formatName) {
-  // FFprobe reports ISO-BMFF files with names such as
-  // "mov,mp4,m4a,3gp,3g2,mj2". A .mp4 filename alone is not sufficient.
-  return String(formatName || '').split(',').some((name) => ['mp4', 'mov', 'm4a', '3gp', '3g2', 'mj2'].includes(name.trim().toLowerCase()));
-}
-
-async function runRemux(sourcePath, temporaryPath, log, shouldCancel) {
-  const executable = process.env.FFMPEG_PATH || 'ffmpeg';
-  const timeoutMs = Math.max(60_000, Number(process.env.REMUX_TIMEOUT_MS || 30 * 60 * 1000));
-  const args = [
-    '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
-    '-i', sourcePath,
-    '-map', '0:v:0', '-map', '0:a?',
-    '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', temporaryPath
-  ];
-
-  await new Promise((resolve, reject) => {
-    const child = spawn(executable, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    let timedOut = false;
-    let cancelled = false;
-    let finished = false;
-    let killTimer = null;
-    const stopChild = () => {
-      if (finished) return;
-      try { child.kill('SIGTERM'); } catch { /* process may already have exited */ }
-      if (!killTimer) killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, 5000);
-    };
-    const timer = setTimeout(() => { timedOut = true; stopChild(); }, timeoutMs);
-    const cancelTimer = setInterval(() => {
-      if (shouldCancel?.()) { cancelled = true; stopChild(); }
-    }, 500);
-
-    child.stderr.setEncoding('utf8').on('data', (chunk) => {
-      stderr = (stderr + chunk).slice(-4000);
-    });
-    child.on('error', (error) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer); clearInterval(cancelTimer); if (killTimer) clearTimeout(killTimer);
-      reject(new Error(`Unable to run FFmpeg (${executable}): ${error.message}. Install FFmpeg or set FFMPEG_PATH.`));
-    });
-    child.on('close', (code, signal) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer); clearInterval(cancelTimer); if (killTimer) clearTimeout(killTimer);
-      if (cancelled) return reject(new Error('Batch cancellation requested during MP4 remux'));
-      if (timedOut) return reject(new Error(`FFmpeg remux timed out after ${Math.round(timeoutMs / 60000)} minutes`));
-      if (code !== 0) return reject(new Error(`FFmpeg remux failed (exit ${code ?? signal}): ${stderr.trim().slice(-1200) || 'no FFmpeg diagnostic available'}`));
-      resolve();
-    });
-  });
-}
-
-async function remuxToMP4(filePath, log, shouldCancel) {
-  const sourceMetadata = await probeVideo(filePath);
-  if (isMP4Container(sourceMetadata.formatName)) {
-    log(`Downloaded file is already MP4-compatible (${sourceMetadata.formatName}; ${sourceMetadata.videoCodec}${sourceMetadata.audioCodec ? `/${sourceMetadata.audioCodec}` : ''}); remux not needed`);
-    return sourceMetadata;
-  }
-
-  if (shouldCancel?.()) throw new Error('Batch cancellation requested before MP4 remux');
-  const temporaryPath = path.join(path.dirname(filePath), 'video.remuxing.mp4');
-  const backupPath = path.join(path.dirname(filePath), 'video.source-original');
-  await fs.rm(temporaryPath, { force: true });
-  log(`Downloaded container is '${sourceMetadata.formatName || 'unknown'}' rather than MP4; remuxing to MP4 without re-encoding`);
-  try {
-    await runRemux(filePath, temporaryPath, log, shouldCancel);
-    const remuxedMetadata = await probeVideo(temporaryPath);
-    if (!isMP4Container(remuxedMetadata.formatName)) {
-      throw new Error(`FFmpeg output is not an MP4 container (detected '${remuxedMetadata.formatName || 'unknown'}')`);
-    }
-    const durationDifference = Math.abs(remuxedMetadata.duration - sourceMetadata.duration);
-    if (durationDifference > Math.max(3, sourceMetadata.duration * 0.001)) {
-      throw new Error(`Remux validation failed: duration changed from ${sourceMetadata.duration.toFixed(2)}s to ${remuxedMetadata.duration.toFixed(2)}s`);
-    }
-    if (!remuxedMetadata.videoCodec) throw new Error('Remux validation failed: output contains no video stream');
-
-    // Validate the new file before replacing the staged source. If replacement fails,
-    // restore the source so a retry does not lose the successfully downloaded payload.
-    await fs.rm(backupPath, { force: true });
-    await fs.rename(filePath, backupPath);
-    try {
-      await fs.rename(temporaryPath, filePath);
-    } catch (error) {
-      await fs.rename(backupPath, filePath).catch(() => {});
-      throw error;
-    }
-    await fs.rm(backupPath, { force: true });
-    const finalStat = await fs.stat(filePath);
-    remuxedMetadata.size = finalStat.size;
-    log(`✅ MP4 remux complete (stream copy, no re-encoding): ${sourceMetadata.size} -> ${finalStat.size} bytes; ${remuxedMetadata.formatName}`);
-    return remuxedMetadata;
-  } finally {
-    await fs.rm(temporaryPath, { force: true }).catch(() => {});
-  }
-}
-
-export async function normalizeDownloadedVideo(filePath, log = () => {}, shouldCancel = () => false) {
-  return remuxToMP4(filePath, log, shouldCancel);
+  return { duration, size, height, width, avgFrameRate: Number.isFinite(avgFrameRate) ? avgFrameRate : 0, qualityName: `${height >= 100 ? height : 720}p` };
 }
 
 async function fetchAsset(url, { referer, cookies, userAgent, timeoutMs = 30000 } = {}) {
@@ -275,20 +191,21 @@ export async function downloadStreamingPlay({ downloadUrl, embedUrl, stageDir, l
       if (response.ok() && contentType.toLowerCase().startsWith('image/') && /(?:deliver\.streamingplay\.biz\/images\/|thumbnail)/i.test(responseUrl)) {
         imageResponses.push({ response, url: responseUrl, contentType });
       }
-      if (subtitleSaved) return;
-      const looksLikeSubtitle = /\.(vtt|srt)(?:$|[?#])/i.test(responseUrl) || /text\/vtt|subrip/i.test(contentType);
-      if (!looksLikeSubtitle || !response.ok()) return;
+      if (subtitleSaved || !response.ok()) return;
+      // Do not treat /images/.../sprite.vtt as a subtitle. It contains image sprite
+      // coordinates for preview thumbnails and would display the URL in the player.
+      if (!isUserUploadedSubtitleUrl(responseUrl)) return;
       const promise = (async () => {
         try {
           const bytes = await response.buffer();
           if (!bytes.length || bytes.length > 20 * 1024 * 1024 || subtitleSaved) return;
           let text = bytes.toString('utf8');
           if (/\.srt(?:$|[?#])/i.test(responseUrl) || !/^WEBVTT(?:\s|$)/m.test(text)) text = convertSrtToVtt(text);
-          if (!/^WEBVTT(?:\s|$)/m.test(text)) return;
+          if (!/^WEBVTT(?:\s|$)/m.test(text) || isSpriteThumbnailVtt(text)) return;
           await fs.writeFile(subtitlePath, text, 'utf8');
           subtitleSaved = true;
           stagedSubtitle = subtitlePath;
-          log('Subtitle asset captured');
+          log('User-uploaded subtitle captured');
         } catch { /* A failed optional subtitle response must not fail the video import. */ }
       })();
       subtitlePromises.push(promise);
@@ -302,7 +219,11 @@ export async function downloadStreamingPlay({ downloadUrl, embedUrl, stageDir, l
     const pageAssets = await page.evaluate(() => {
       const meta = (selector) => document.querySelector(selector)?.content || '';
       const video = document.querySelector('video');
-      const track = document.querySelector('video track[src], track[src]');
+      const tracks = [...document.querySelectorAll('video track[src], track[src]')].map((track) => ({
+        src: track.src || track.getAttribute('src') || '',
+        lang: track.srclang || '',
+        label: track.label || ''
+      }));
       const imageCandidates = [...document.images].map((img) => ({
         url: img.currentSrc || img.src || img.dataset.src || img.dataset.original || img.dataset.lazySrc || '',
         area: (img.naturalWidth || img.width || 0) * (img.naturalHeight || img.height || 0)
@@ -317,11 +238,14 @@ export async function downloadStreamingPlay({ downloadUrl, embedUrl, stageDir, l
         .find((url) => /^https?:\/\//i.test(url)) || '';
       return {
         thumbnailUrl: meta('meta[property="og:image"]') || meta('meta[name="twitter:image"]') || video?.poster || image?.url || backgroundImage || '',
-        subtitleUrl: track?.src || '',
-        trackLang: track?.srclang || '',
-        trackLabel: track?.label || ''
+        tracks
       };
     });
+    const uploadedSubtitleTrack = (pageAssets.tracks || []).find((track) => isUserUploadedSubtitleUrl(track.src));
+    pageAssets.subtitleUrl = uploadedSubtitleTrack?.src || '';
+    if ((pageAssets.tracks || []).length > 0 && !pageAssets.subtitleUrl) {
+      log('Ignoring non-uploaded subtitle track(s), including sprite thumbnail tracks');
+    }
     const cookies = await page.cookies();
     const userAgent = await page.evaluate(() => navigator.userAgent);
 
@@ -356,8 +280,8 @@ export async function downloadStreamingPlay({ downloadUrl, embedUrl, stageDir, l
       } else log('Thumbnail URL was found but could not be downloaded; continuing without one');
     } else log('No thumbnail URL found in page metadata or image requests; continuing without one');
 
-    if (pageAssets.subtitleUrl && !subtitleSaved) {
-      log('Start downloading subtitle');
+    if (pageAssets.subtitleUrl && isUserUploadedSubtitleUrl(pageAssets.subtitleUrl) && !subtitleSaved) {
+      log('Start downloading user-uploaded subtitle');
       try {
         const subtitleHost = new URL(pageAssets.subtitleUrl).hostname;
         const subtitleCookie = cookies.filter((cookie) => subtitleHost === cookie.domain.replace(/^\./, '') || subtitleHost.endsWith(`.${cookie.domain.replace(/^\./, '')}`)).map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
@@ -365,7 +289,7 @@ export async function downloadStreamingPlay({ downloadUrl, embedUrl, stageDir, l
         if (subtitleResponse.ok) {
           let text = await subtitleResponse.text();
           if (/\.srt(?:$|[?#])/i.test(pageAssets.subtitleUrl) || !/^WEBVTT(?:\s|$)/m.test(text)) text = convertSrtToVtt(text);
-          if (/^WEBVTT(?:\s|$)/m.test(text)) {
+          if (/^WEBVTT(?:\s|$)/m.test(text) && !isSpriteThumbnailVtt(text)) {
             await fs.writeFile(subtitlePath, text, 'utf8');
             stagedSubtitle = subtitlePath;
             subtitleSaved = true;
@@ -436,11 +360,10 @@ export async function downloadStreamingPlay({ downloadUrl, embedUrl, stageDir, l
     downloadedVideo = true;
     const stat = await fs.stat(videoPath);
     log(`Video downloaded - Received: ${stat.size} Total: ${stat.size}`);
-    metadata = await remuxToMP4(videoPath, log, shouldCancel);
-    const finalStat = await fs.stat(videoPath);
-    metadata.size = finalStat.size;
+    metadata = await probeVideo(videoPath);
+    metadata.size = stat.size;
     metadata.qualityName = `${metadata.height >= 100 ? metadata.height : 720}p`;
-    log(`Validated MP4 metadata: ${metadata.width}x${metadata.height}, ${metadata.duration.toFixed(2)}s, ${finalStat.size} bytes (${metadata.formatName}; ${metadata.videoCodec}${metadata.audioCodec ? `/${metadata.audioCodec}` : ''})`);
+    log(`Video metadata: ${metadata.width}x${metadata.height}, ${metadata.duration.toFixed(2)}s, ${stat.size} bytes`);
     return { name: name.trim(), videoPath, thumbnailPath: stagedThumbnail, subtitlePath: stagedSubtitle, metadata };
   } catch (error) {
     if (downloadedVideo) log('Video file retained in staging for retry');
