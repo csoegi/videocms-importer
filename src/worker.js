@@ -8,8 +8,7 @@ export const events = new EventEmitter();
 events.setMaxListeners(0);
 const activeBatches = new Set();
 const activeItems = new Set();
-const configuredParallel = Number(process.env.MAX_PARALLEL_JOBS || 8);
-const maxParallel = Number.isFinite(configuredParallel) ? Math.max(1, Math.floor(configuredParallel)) : 8;
+const maxParallel = Math.max(1, Math.min(8, Number(process.env.MAX_PARALLEL_JOBS || 2)));
 const mediaRoot = path.resolve(process.env.MEDIA_ROOT || '/data/media/videos');
 const stagingRoot = path.resolve(process.env.STAGING_ROOT || path.join(path.dirname(mediaRoot), '.videocms-importer-staging'));
 const logDir = path.resolve(process.env.LOG_DIR || './logs');
@@ -27,9 +26,9 @@ export async function logMessage(batchId, itemId, message) {
   const record = addLog(batchId, itemId, message);
   const line = `[${record.created_at}] ${message}\n`;
   await fs.appendFile(path.join(logDir, `${batchId}.log`), line, 'utf8').catch(() => {});
-  // Progress/log messages travel as lightweight log events. Batch snapshots are
-  // emitted at meaningful state transitions, not for every download progress tick.
   events.emit(`batch:${batchId}`, { type: 'log', log: record });
+  const batch = getBatch(batchId);
+  events.emit(`batch:${batchId}`, { type: 'batch', batch: summarizeBatch(batch) });
 }
 
 function summarizeBatch(batch) {
