@@ -56,6 +56,9 @@ function waitForBrowserDownload(client, log, timeoutMs, shouldCancel) {
     let guid = null;
     let suggestedFilename = null;
     let finished = false;
+    let lastProgressLogAt = 0;
+    let lastProgressLoggedBytes = -1;
+    const progressLogIntervalMs = Math.max(5000, Number(process.env.DOWNLOAD_PROGRESS_LOG_INTERVAL_MS || 30000));
     const timeout = setTimeout(() => finish(new Error(`Timed out waiting for browser download after ${Math.round(timeoutMs / 60000)} minutes`)), timeoutMs);
     const cancelPoll = setInterval(() => { if (shouldCancel?.()) finish(new Error('Batch cancellation requested')); }, 1000);
     const finish = (error, value) => {
@@ -76,7 +79,16 @@ function waitForBrowserDownload(client, log, timeoutMs, shouldCancel) {
       if (guid && event.guid !== guid) return;
       const received = Number(event.receivedBytes || 0);
       const total = Number(event.totalBytes || 0);
-      log(`State: ${event.state === 'inProgress' ? 'InProgress' : event.state} - Received: ${received} Total: ${total}`);
+      const now = Date.now();
+      const terminal = event.state !== 'inProgress';
+      if (terminal || (received !== lastProgressLoggedBytes && now - lastProgressLogAt >= progressLogIntervalMs)) {
+        const mib = (bytes) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+        log(terminal
+          ? `Download ${event.state}: received ${mib(received)}${total > 0 ? ` of ${mib(total)}` : ''}`
+          : `Download progress: received ${mib(received)}${total > 0 ? ` of ${mib(total)}` : ''}`);
+        lastProgressLogAt = now;
+        lastProgressLoggedBytes = received;
+      }
       if (event.state === 'completed') finish(null, { guid: event.guid, suggestedFilename, receivedBytes: received, totalBytes: total });
       if (event.state === 'canceled') finish(new Error('Browser download was canceled'));
     };

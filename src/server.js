@@ -55,7 +55,6 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false, limit: '2mb' }));
-app.use('/api/', rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false }));
 app.use(express.static(path.resolve('public'), { index: false, dotfiles: 'deny' }));
 
 function normalizeDownloadUrl(value) {

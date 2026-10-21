@@ -89,8 +89,10 @@ function connectEvents(batchId) {
     const batch = JSON.parse(event.data);
     if (!batch) return;
     renderDetails(batch);
-    refreshBatches().catch(() => {});
-    if (['completed','completed_with_errors','failed','cancelled'].includes(batch.status)) eventSource?.close();
+    if (['completed','completed_with_errors','failed','cancelled'].includes(batch.status)) {
+      refreshBatches().catch(() => {});
+      eventSource?.close();
+    }
   });
   eventSource.onerror = () => { /* EventSource reconnects automatically. */ };
 }
