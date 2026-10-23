@@ -3,6 +3,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { addLog, db, getBatch, getItem, refreshBatch, updateBatch, updateItem, wasCancelRequested } from './store.js';
 import { downloadStreamingPlay, normalizeDownloadedVideo, safeFilename } from './provider.js';
+import { fitVideoCMSName } from './name-utils.js';
 
 export const events = new EventEmitter();
 events.setMaxListeners(0);
@@ -27,9 +28,9 @@ export async function logMessage(batchId, itemId, message) {
   const record = addLog(batchId, itemId, message);
   const line = `[${record.created_at}] ${message}\n`;
   await fs.appendFile(path.join(logDir, `${batchId}.log`), line, 'utf8').catch(() => {});
+  // Progress/log messages travel as lightweight log events. Batch snapshots are
+  // emitted at meaningful state transitions, not for every download progress tick.
   events.emit(`batch:${batchId}`, { type: 'log', log: record });
-  const batch = getBatch(batchId);
-  events.emit(`batch:${batchId}`, { type: 'batch', batch: summarizeBatch(batch) });
 }
 
 function summarizeBatch(batch) {
@@ -167,19 +168,23 @@ async function processItem(itemId) {
       updateItem(itemId, { status: 'registering' });
       await logMessage(batchId, itemId, `[video #${item.ordinal}] Creating VideoCMS import record`);
       const { base, key } = apiConfig();
+      const apiName = fitVideoCMSName(name, 128);
+      if (apiName !== String(name ?? '').trim()) {
+        await logMessage(batchId, itemId, `[video #${item.ordinal}] Video name exceeds VideoCMS's 128-character limit; using a trimmed name for registration. The downloaded media is being reused.`);
+      }
       const thumbnailName = stagedThumbnail ? `thumbnail${path.extname(stagedThumbnail).toLowerCase() || '.jpg'}` : '';
-      const subtitleName = stagedSubtitle ? `${safeFilename(name, 90)}.vtt` : '';
+      const subtitleName = stagedSubtitle ? `${safeFilename(apiName, 90)}.vtt` : '';
       const payload = {
         request_id: item.request_id,
         embed_url: item.embed_url,
-        name,
+        name: apiName,
         parent_folder_id: Number(process.env.PARENT_FOLDER_ID || 0),
         size: Number(metadata.size), duration: Number(metadata.duration),
         width: Number(metadata.width || 0), height: Number(metadata.height || 0),
         avg_frame_rate: Number(metadata.avgFrameRate || 0),
         quality_name: metadata.qualityName || '720p',
         ...(thumbnailName ? { thumbnail: thumbnailName } : {}),
-        ...(subtitleName ? { subtitles: [{ name, lang: 'und', filename: subtitleName, type: 'vtt' }] } : {})
+        ...(subtitleName ? { subtitles: [{ name: apiName, lang: 'und', filename: subtitleName, type: 'vtt' }] } : {})
       };
       apiResponse = await apiRequest(`${base}/importer/imports`, key, { method: 'POST', body: JSON.stringify(payload) });
       updateItem(itemId, { api_response_json: JSON.stringify(apiResponse), link_uuid: apiResponse.link_uuid, file_uuid: apiResponse.file_uuid, status: 'placing' });
