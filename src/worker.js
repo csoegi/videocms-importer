@@ -158,10 +158,24 @@ async function getOrDownload(item) {
       return { stageDir, stagedVideo, stagedThumbnail, stagedSubtitle, metadata, name };
     }
 
-    // Legacy versions did not persist name/staged_video until remux succeeded. Recover the
-    // title/assets from the provider page but explicitly skip the browser download for this file.
+    // Legacy versions did not persist the title/metadata for jobs whose first remux failed.
+    // Retry the staged file locally BEFORE contacting StreamingPlay. Most irrecoverable files
+    // will fail here and should not trigger needless embed/download-page navigations.
     updateItem(item.id, { status: 'downloading', stage_dir: stageDir, staged_video: stagedVideo, error: null });
-    await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Found a staged source without saved metadata; recovering its title and remuxing it without downloading again`);
+    await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Found a staged source without saved metadata; trying local remux before contacting the provider`);
+    metadata = await normalizeDownloadedVideo(
+      stagedVideo,
+      (message) => logMessage(item.batch_id, item.id, `[video #${item.ordinal}] ${message}`),
+      () => wasCancelRequested(item.batch_id)
+    );
+    updateItem(item.id, {
+      stage_dir: stageDir,
+      staged_video: stagedVideo,
+      video_bytes: metadata.size,
+      metadata_json: JSON.stringify(metadata),
+      error: null
+    });
+    await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Existing staged source passed remux/validation; recovering title and optional assets now`);
     const recovered = await downloadStreamingPlay({
       downloadUrl: item.source_url,
       embedUrl: item.embed_url,
