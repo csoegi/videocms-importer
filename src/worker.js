@@ -97,6 +97,30 @@ async function fileExistsWithBytes(filePath) {
   try { const stat = await fs.stat(filePath); return stat.isFile() && stat.size > 0; } catch { return false; }
 }
 
+function isInsideStagingRoot(candidatePath, minimumDepth = 2) {
+  const candidate = path.resolve(candidatePath);
+  const relative = path.relative(stagingRoot, candidate);
+  const parts = relative.split(path.sep).filter(Boolean);
+  return parts.length >= minimumDepth && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+async function cleanupCompletedStageDirectory(stageDir) {
+  if (!stageDir) return false;
+  const resolved = path.resolve(stageDir);
+  if (!isInsideStagingRoot(resolved)) {
+    throw new Error(`Refusing to clean a staging path outside STAGING_ROOT: ${resolved}`);
+  }
+  await fs.rm(resolved, { recursive: true, force: true });
+  // Remove the containing batch directory only if it is empty; never recurse into it.
+  const batchDirectory = path.dirname(resolved);
+  if (isInsideStagingRoot(batchDirectory, 1)) {
+    await fs.rmdir(batchDirectory).catch((error) => {
+      if (!['ENOTEMPTY', 'EEXIST', 'ENOENT'].includes(error.code)) throw error;
+    });
+  }
+  return true;
+}
+
 async function getOrDownload(item) {
   const stageDir = item.stage_dir || path.join(stagingRoot, item.batch_id, String(item.ordinal).padStart(5, '0'));
   await fs.mkdir(stageDir, { recursive: true });
@@ -106,16 +130,63 @@ async function getOrDownload(item) {
   let metadata = item.metadata_json ? JSON.parse(item.metadata_json) : null;
   let name = item.name || null;
 
-  if (await fileExistsWithBytes(stagedVideo) && metadata && name) {
-    // Older jobs may have staged an MPEG-TS payload named video.mp4. Normalize it
-    // before creating records so metadata reflects the actual remuxed MP4.
-    metadata = await normalizeDownloadedVideo(
-      stagedVideo,
-      (message) => logMessage(item.batch_id, item.id, `[video #${item.ordinal}] ${message}`),
-      () => wasCancelRequested(item.batch_id)
-    );
-    updateItem(item.id, { video_bytes: metadata.size, metadata_json: JSON.stringify(metadata) });
-    await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Reusing validated video from staging`);
+  if (await fileExistsWithBytes(stagedVideo)) {
+    if (metadata && name) {
+      // Revalidate persisted staged files rather than trusting metadata written by an older version.
+      metadata = await normalizeDownloadedVideo(
+        stagedVideo,
+        (message) => logMessage(item.batch_id, item.id, `[video #${item.ordinal}] ${message}`),
+        () => wasCancelRequested(item.batch_id)
+      );
+      updateItem(item.id, { stage_dir: stageDir, staged_video: stagedVideo, video_bytes: metadata.size, metadata_json: JSON.stringify(metadata), error: null });
+      await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Reusing validated video from staging`);
+      return { stageDir, stagedVideo, stagedThumbnail, stagedSubtitle, metadata, name };
+    }
+
+    if (name) {
+      // A previous remux may have failed before metadata was persisted. Keep the existing
+      // large source and retry the remux directly, without another provider download.
+      updateItem(item.id, { status: 'downloading', stage_dir: stageDir, staged_video: stagedVideo, error: null });
+      await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Found an existing staged video; retrying validation/remux without downloading it again`);
+      metadata = await normalizeDownloadedVideo(
+        stagedVideo,
+        (message) => logMessage(item.batch_id, item.id, `[video #${item.ordinal}] ${message}`),
+        () => wasCancelRequested(item.batch_id)
+      );
+      updateItem(item.id, { staged_video: stagedVideo, video_bytes: metadata.size, metadata_json: JSON.stringify(metadata), error: null });
+      await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Existing staged video validated successfully`);
+      return { stageDir, stagedVideo, stagedThumbnail, stagedSubtitle, metadata, name };
+    }
+
+    // Legacy versions did not persist name/staged_video until remux succeeded. Recover the
+    // title/assets from the provider page but explicitly skip the browser download for this file.
+    updateItem(item.id, { status: 'downloading', stage_dir: stageDir, staged_video: stagedVideo, error: null });
+    await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Found a staged source without saved metadata; recovering its title and remuxing it without downloading again`);
+    const recovered = await downloadStreamingPlay({
+      downloadUrl: item.source_url,
+      embedUrl: item.embed_url,
+      stageDir,
+      existingVideoPath: stagedVideo,
+      log: (message) => logMessage(item.batch_id, item.id, `[video #${item.ordinal}] ${message}`),
+      shouldCancel: () => wasCancelRequested(item.batch_id),
+      onDownloaded: async ({ videoPath, thumbnailPath, subtitlePath, name: discoveredName }) => {
+        updateItem(item.id, {
+          stage_dir: stageDir, staged_video: videoPath, staged_thumbnail: thumbnailPath,
+          staged_subtitle: subtitlePath, ...(discoveredName ? { name: discoveredName } : {}), error: null
+        });
+        await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Saved staged source state before remux so retries can reuse it`);
+      }
+    });
+    stagedVideo = recovered.videoPath;
+    stagedThumbnail = recovered.thumbnailPath;
+    stagedSubtitle = recovered.subtitlePath;
+    metadata = recovered.metadata;
+    name = recovered.name;
+    updateItem(item.id, {
+      status: 'registering', name, stage_dir: stageDir, staged_video: stagedVideo,
+      staged_thumbnail: stagedThumbnail, staged_subtitle: stagedSubtitle,
+      video_bytes: metadata.size, metadata_json: JSON.stringify(metadata), error: null
+    });
     return { stageDir, stagedVideo, stagedThumbnail, stagedSubtitle, metadata, name };
   }
 
@@ -126,7 +197,14 @@ async function getOrDownload(item) {
     embedUrl: item.embed_url,
     stageDir,
     log: (message) => logMessage(item.batch_id, item.id, `[video #${item.ordinal}] ${message}`),
-    shouldCancel: () => wasCancelRequested(item.batch_id)
+    shouldCancel: () => wasCancelRequested(item.batch_id),
+    onDownloaded: async ({ videoPath, thumbnailPath, subtitlePath, name: discoveredName }) => {
+      updateItem(item.id, {
+        stage_dir: stageDir, staged_video: videoPath, staged_thumbnail: thumbnailPath,
+        staged_subtitle: subtitlePath, ...(discoveredName ? { name: discoveredName } : {}), error: null
+      });
+      await logMessage(item.batch_id, item.id, `[video #${item.ordinal}] Saved staged source state before remux so retries can reuse it`);
+    }
   });
   stagedVideo = result.videoPath;
   stagedThumbnail = result.thumbnailPath;
@@ -240,6 +318,19 @@ async function processItem(itemId) {
     });
     updateItem(itemId, { status: 'completed', error: null, link_uuid: completed.link_uuid || apiResponse.link_uuid, file_uuid: completed.file_uuid || apiResponse.file_uuid });
     await logMessage(batchId, itemId, `[video #${item.ordinal}] ✅ All downloads completed - path: ${path.join(mediaRoot, apiResponse.file_uuid)}`);
+
+    // Staged assets are no longer needed once VideoCMS has confirmed completion.
+    // Cleanup is deliberately best-effort: a cleanup failure must not turn a successful import into a failed job.
+    const completedStageDir = stageDir || item.stage_dir || path.join(stagingRoot, item.batch_id, String(item.ordinal).padStart(5, '0'));
+    try {
+      const cleaned = await cleanupCompletedStageDirectory(completedStageDir);
+      if (cleaned) {
+        updateItem(itemId, { stage_dir: null, staged_video: null, staged_thumbnail: null, staged_subtitle: null });
+        await logMessage(batchId, itemId, `[video #${item.ordinal}] Cleaned staging files after successful import`);
+      }
+    } catch (cleanupError) {
+      await logMessage(batchId, itemId, `[video #${item.ordinal}] ⚠️ Import succeeded, but staging cleanup failed: ${cleanError(cleanupError)}`);
+    }
   } catch (error) {
     const message = cleanError(error);
     updateItem(itemId, { status: wasCancelRequested(batchId) ? 'queued' : 'failed', error: wasCancelRequested(batchId) ? null : message });

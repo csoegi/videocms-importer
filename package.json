@@ -7,9 +7,12 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "NODE_ENV=development node --watch src/server.js",
-    "check": "node --check src/server.js && node --check src/worker.js && node --check src/provider.js && node --check src/name-utils.js && node --check src/store.js"
+    "check": "node --check src/server.js && node --check src/worker.js && node --check src/provider.js && node --check src/name-utils.js && node --check src/store.js && node --check scripts/cleanup-staging.js",
+    "cleanup:staging": "node scripts/cleanup-staging.js"
   },
-  "engines": { "node": ">=20.11" },
+  "engines": {
+    "node": ">=20.11"
+  },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
     "csv-parse": "^5.6.0",
