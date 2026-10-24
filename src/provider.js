@@ -126,7 +126,7 @@ async function waitForDownloadedFile(dir, startedAt, timeoutMs) {
   throw new Error('The browser reported download completion, but no stable downloaded file was found');
 }
 
-async function probeVideo(filePath, { extended = false } = {}) {
+async function probeVideo(filePath, { extended = false, allowMissingDimensions = false } = {}) {
   const executable = process.env.FFPROBE_PATH || 'ffprobe';
   const args = ['-v', 'error'];
   if (extended) {
@@ -159,9 +159,13 @@ async function probeVideo(filePath, { extended = false } = {}) {
   if (!video.codec_name) throw new Error(`No video stream found in ${path.basename(filePath)}`);
   const fps = String(video.avg_frame_rate || '0/1').split('/').map(Number);
   const avgFrameRate = fps[1] ? fps[0] / fps[1] : 0;
-  const height = Number(video.height || 0);
-  const width = Number(video.width || 0);
-  if (width <= 0 || height <= 0) throw new Error(`Video dimensions are missing for ${path.basename(filePath)} (detected ${width}x${height})`);
+  const rawHeight = Number(video.height || 0);
+  const rawWidth = Number(video.width || 0);
+  const height = Number.isFinite(rawHeight) && rawHeight > 0 ? rawHeight : 0;
+  const width = Number.isFinite(rawWidth) && rawWidth > 0 ? rawWidth : 0;
+  if ((width <= 0 || height <= 0) && !allowMissingDimensions) {
+    throw new Error(`Video dimensions are missing for ${path.basename(filePath)} (detected ${width}x${height})`);
+  }
   return {
     duration, size, height, width, formatName: String(parsed.format?.format_name || ''),
     videoCodec: String(video.codec_name || ''), audioCodec: String(audio.codec_name || ''),
@@ -185,6 +189,29 @@ async function probeVideoWithRecovery(filePath, log, label = 'media') {
       return await probeVideo(filePath, { extended: true });
     } catch (recoveryError) {
       throw new Error(`FFprobe could not validate ${label}. Standard probe: ${initialMessage}. Extended probe: ${conciseError(recoveryError)}`);
+    }
+  }
+}
+
+// A source with a detectable video stream and duration but missing coded dimensions
+// must still reach FFmpeg. For MPEG-TS this can happen when H.264 parameter sets
+// appear late in the stream. Strict validation is still required for the final MP4.
+async function probeSourceForRemux(filePath, log) {
+  try {
+    return await probeVideoWithRecovery(filePath, log, 'downloaded source');
+  } catch (error) {
+    const message = conciseError(error);
+    if (!message.includes('Video dimensions are missing')) throw error;
+
+    log(`FFprobe found a video stream but could not determine its dimensions; retrying an extended probe and allowing a remux attempt. The remuxed output must still pass strict validation.`);
+    try {
+      const metadata = await probeVideo(filePath, { extended: true, allowMissingDimensions: true });
+      if (metadata.width <= 0 || metadata.height <= 0) {
+        log('⚠️ Source dimensions remain unknown after extended probing; attempting stream-copy remux because FFmpeg may discover parameter sets that FFprobe did not. If the output still lacks dimensions, the file will be rejected.');
+      }
+      return metadata;
+    } catch (probeError) {
+      throw new Error(`Downloaded source lacks enough metadata to attempt remux. Original probe failure: ${message}. Relaxed extended probe: ${conciseError(probeError)}`);
     }
   }
 }
@@ -269,8 +296,9 @@ async function validateRemuxOutput(temporaryPath, sourceMetadata, log) {
 }
 
 async function remuxToMP4(filePath, log, shouldCancel) {
-  const sourceMetadata = await probeVideoWithRecovery(filePath, log, 'downloaded source');
-  if (isMP4Container(sourceMetadata.formatName)) {
+  const sourceMetadata = await probeSourceForRemux(filePath, log);
+  const sourceHasDimensions = sourceMetadata.width > 0 && sourceMetadata.height > 0;
+  if (isMP4Container(sourceMetadata.formatName) && sourceHasDimensions) {
     log(`Downloaded file is already MP4-compatible (${sourceMetadata.formatName}; ${sourceMetadata.videoCodec}${sourceMetadata.audioCodec ? `/${sourceMetadata.audioCodec}` : ''}); remux not needed`);
     return sourceMetadata;
   }
@@ -279,7 +307,14 @@ async function remuxToMP4(filePath, log, shouldCancel) {
   const temporaryPath = path.join(path.dirname(filePath), 'video.remuxing.mp4');
   const backupPath = path.join(path.dirname(filePath), 'video.source-original');
   await fs.rm(temporaryPath, { force: true });
-  log(`Downloaded container is '${sourceMetadata.formatName || 'unknown'}' rather than MP4; remuxing to MP4 without re-encoding`);
+  if (!sourceHasDimensions) {
+    log(`⚠️ Source dimensions are unavailable (${sourceMetadata.width}x${sourceMetadata.height}); attempting stream-copy remux so FFmpeg can inspect/recover codec metadata. Final MP4 validation still requires valid dimensions.`);
+  }
+  if (isMP4Container(sourceMetadata.formatName)) {
+    log(`Downloaded container is MP4-compatible ('${sourceMetadata.formatName}') but needs normalization because source metadata is incomplete; remuxing without re-encoding`);
+  } else {
+    log(`Downloaded container is '${sourceMetadata.formatName || 'unknown'}' rather than MP4; remuxing to MP4 without re-encoding`);
+  }
 
   let remuxedMetadata = null;
   let standardError = null;
